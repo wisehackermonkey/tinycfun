@@ -1,3 +1,5 @@
+# project specific
+./chime-sms-2m
 # Python specific
 .env
 .git/
@@ -13,6 +15,7 @@ Desktop.ini
 __pycache__/
 *.py[cod]
 *$py.class
+
 
 # C extensions
 *.so
