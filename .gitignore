@@ -1,5 +1,5 @@
 # project specific
-./chime-sms-2m
+chime-sms-2m/*
 # Python specific
 .env
 .git/
@@ -118,3 +118,4 @@ dmypy.json
 .pytype/
 # Cython debug symbols
 cython_debug/
+chime/chime.exe
