@@ -1,6 +1,7 @@
-LIBRARY tsf_hello
+LIBRARY tsf_hello.dll
+
 EXPORTS
-    DllGetClassObject
-    DllCanUnloadNow
-    DllRegisterServer
-    DllUnregisterServer
+_DllCanUnloadNow@0
+_DllGetClassObject@12
+_DllRegisterServer@0
+_DllUnregisterServer@0
