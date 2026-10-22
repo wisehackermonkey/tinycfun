@@ -23,8 +23,14 @@
 #include <msctf.h>
 #include <wchar.h>
 
+/* --- Chime integration --- */
+#include "chime.h"
+#include "cifg_int8_bin.h"
+#include <process.h>
+#include <stdlib.h>
+#include <string.h>
+
 /* ------------------------------------------------------------ identity */
-/* Generate your own GUIDs for a real project (guidgen / uuidgen / PowerShell [guid]::NewGuid()) */
 static const GUID CLSID_SampleTip =
     {0xB6A1F3C2,0x5D47,0x4E89,{0xA0,0xB1,0x7C,0x2D,0x9E,0x3F,0x4A,0x60}};
 static const GUID GUID_SampleProfile =
@@ -35,69 +41,216 @@ static const GUID GUID_SampleProfile =
 #endif
 
 #define TIP_DESC     L"Sample C Suggestions"
-#define TIP_LANGID   0x0409          /* en-US: shows up under English (United States) */
+#define TIP_LANGID   0x0409
 
 #define MAX_BUF      32
 #define MAX_CAND     9
 #define BEFORE_CHARS 12
 
 static HINSTANCE g_hinst;
-static LONG      g_dllRefs;          /* objects alive + server locks */
+static LONG      g_dllRefs;
+
+/* --- Chime integration --- */
+static Chime *g_chime = NULL;
+static CRITICAL_SECTION g_chime_cs;
+static LONG g_chime_cs_init = 0;
+static WCHAR g_chime_temp_path[MAX_PATH];   /* extracted model path */
+static BOOL  g_chime_temp_owned = FALSE;
 
 static void Log(const WCHAR *s) { OutputDebugStringW(s); }
 
-/* ------------------------------------------------------ suggestion list */
-static const WCHAR *const g_words[] = {
-    L"hello", L"help", L"helmet", L"helicopter", L"world", L"word", L"work",
-    L"works", L"workflow", L"window", L"windows", L"text", L"service",
-    L"framework", L"input", L"method", L"editor", L"example", L"candidate",
-    L"suggestion", L"keyboard", L"language", L"compile", L"compiler", NULL
-};
+/* --- Chime integration --- */
+static void ChimeEnsureCs(void)
+{
+    if (InterlockedCompareExchange(&g_chime_cs_init, 1, 0) == 0) {
+        InitializeCriticalSection(&g_chime_cs);
+    }
+}
+
+/* Extract embedded model to a temp file once; returns path or NULL. */
+static const char *ChimeExtractModel(void)
+{
+    if (g_chime_temp_path[0] != 0) {
+        /* return cached path as UTF-8 */
+        static char utf8[MAX_PATH * 4];
+        WideCharToMultiByte(CP_UTF8, 0, g_chime_temp_path, -1,
+                            utf8, sizeof(utf8), NULL, NULL);
+        return utf8;
+    }
+
+    WCHAR tmpdir[MAX_PATH];
+    DWORD n = GetTempPathW(MAX_PATH, tmpdir);
+    if (n == 0 || n >= MAX_PATH) return NULL;
+
+    /* unique-ish name per process */
+    wcscpy(g_chime_temp_path, tmpdir);
+    wsprintfW(g_chime_temp_path + wcslen(g_chime_temp_path),
+              L"tipdemo_%08lx_cifg_int8.bin", (unsigned long)GetCurrentProcessId());
+
+    HANDLE h = CreateFileW(g_chime_temp_path, GENERIC_WRITE, 0, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        g_chime_temp_path[0] = 0;
+        return NULL;
+    }
+
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, cifg_int8_bin, cifg_int8_bin_len, &written, NULL)
+              && written == cifg_int8_bin_len;
+    CloseHandle(h);
+    if (!ok) {
+        DeleteFileW(g_chime_temp_path);
+        g_chime_temp_path[0] = 0;
+        return NULL;
+    }
+    g_chime_temp_owned = TRUE;
+
+    static char utf8[MAX_PATH * 4];
+    WideCharToMultiByte(CP_UTF8, 0, g_chime_temp_path, -1,
+                        utf8, sizeof(utf8), NULL, NULL);
+    return utf8;
+}
+
+static void ChimeLoad(void)
+{
+    const char *path;
+    ChimeEnsureCs();
+    if (g_chime) return;
+    EnterCriticalSection(&g_chime_cs);
+    if (!g_chime) {
+        path = ChimeExtractModel();
+        if (path) {
+            g_chime = chime_load(path);
+        }
+    }
+    LeaveCriticalSection(&g_chime_cs);
+}
+
+static void ChimeUnload(void)
+{
+    if (g_chime_cs_init) {
+        EnterCriticalSection(&g_chime_cs);
+        if (g_chime) {
+            chime_free(g_chime);
+            g_chime = NULL;
+        }
+        LeaveCriticalSection(&g_chime_cs);
+    }
+    if (g_chime_temp_owned && g_chime_temp_path[0]) {
+        DeleteFileW(g_chime_temp_path);
+        g_chime_temp_path[0] = 0;
+        g_chime_temp_owned = FALSE;
+    }
+}
 
 /* ----------------------------------------------------------- main object */
 typedef struct Tip {
-    ITfTextInputProcessor tip;       /* interface 1 */
-    ITfKeyEventSink       sink;      /* interface 2 */
+    ITfTextInputProcessor tip;
+    ITfKeyEventSink       sink;
     LONG                  ref;
 
     ITfThreadMgr         *tm;
     TfClientId            client;
     HWND                  popup;
 
-    WCHAR                 buf[MAX_BUF];       /* what the user typed */
+    WCHAR                 buf[MAX_BUF];
     int                   len;
-    const WCHAR          *cand[MAX_CAND];     /* current suggestions */
+    const WCHAR          *cand[MAX_CAND];
     int                   ncand, sel;
-    WCHAR                 before[BEFORE_CHARS + 1]; /* text read before caret */
-    POINT                 caret;              /* screen position for popup */
+    WCHAR                 before[BEFORE_CHARS + 1];
+    POINT                 caret;
+
+    /* --- Chime integration --- */
+    char                 *chime_cand[MAX_CAND];
+    int                   chime_ncand;
 } Tip;
 
 #define TIP_FROM_TIP(p)  CONTAINING_RECORD(p, Tip, tip)
 #define TIP_FROM_SINK(p) CONTAINING_RECORD(p, Tip, sink)
 
+/* --- Chime integration --- */
+static void FreeTipCandidates(Tip *t)
+{
+    int i;
+    for (i = 0; i < t->chime_ncand; i++) {
+        if (t->chime_cand[i]) {
+            chime_free_suggestions(&t->chime_cand[i], 1);
+            t->chime_cand[i] = NULL;
+        }
+    }
+    t->chime_ncand = 0;
+}
+
+static char **get_suggestions(const char *prefix, int k, size_t *n_out)
+{
+    char **sug = NULL;
+    *n_out = 0;
+    if (!g_chime || !prefix) return NULL;
+    EnterCriticalSection(&g_chime_cs);
+    sug = chime_suggest(g_chime, prefix, k, n_out);
+    LeaveCriticalSection(&g_chime_cs);
+    return sug;
+}
+
+static void Utf8ToWide(const char *src, WCHAR *dst, int dstcch)
+{
+    if (dstcch <= 0) return;
+    dst[0] = 0;
+    if (!src) return;
+    MultiByteToWideChar(CP_UTF8, 0, src, -1, dst, dstcch);
+}
+
 static void Suggest(Tip *t)
 {
     int i;
+    char prefix[MAX_BUF];
+    char **sug = NULL;
+    size_t n = 0;
+
+    FreeTipCandidates(t);
     t->ncand = 0;
     t->sel   = 0;
     if (t->len == 0) return;
-    for (i = 0; g_words[i] && t->ncand < MAX_CAND; i++)
-        if (_wcsnicmp(g_words[i], t->buf, t->len) == 0)
-            t->cand[t->ncand++] = g_words[i];
+
+    /* --- Chime integration --- */
+    WideCharToMultiByte(CP_UTF8, 0, t->buf, -1, prefix, sizeof(prefix), NULL, NULL);
+    sug = get_suggestions(prefix, MAX_CAND, &n);
+
+    if (sug && n > 0) {
+        if (n > MAX_CAND) n = MAX_CAND;
+        t->chime_ncand = (int)n;
+        for (i = 0; i < (int)n; i++) {
+            t->chime_cand[i] = sug[i];
+        }
+        chime_free_suggestions(sug, 0);
+        sug = NULL;
+    } else {
+        goto cleanup;
+    }
+
+    for (i = 0; i < t->chime_ncand && t->ncand < MAX_CAND; i++)
+        t->cand[t->ncand++] = t->buf;
+
+cleanup:
+    if (sug) {
+        chime_free_suggestions(sug, n);
+    }
 }
 
 /* ----------------------------------------------------------- popup window */
 static void PopupMetrics(HDC dc, Tip *t, int *w, int *h)
 {
-    WCHAR line[96];
+    WCHAR line[256];
     SIZE sz;
     int i, maxw = 120;
 
     wsprintfW(line, L"> %s", t->buf);
     GetTextExtentPoint32W(dc, line, lstrlenW(line), &sz);
     if (sz.cx > maxw) maxw = sz.cx;
-    for (i = 0; i < t->ncand; i++) {
-        wsprintfW(line, L"%d. %s", i + 1, t->cand[i]);
+    for (i = 0; i < t->chime_ncand; i++) {
+        WCHAR wcand[MAX_BUF];
+        Utf8ToWide(t->chime_cand[i], wcand, MAX_BUF);
+        wsprintfW(line, L"%d. %s", i + 1, wcand);
         GetTextExtentPoint32W(dc, line, lstrlenW(line), &sz);
         if (sz.cx > maxw) maxw = sz.cx;
     }
@@ -106,7 +259,7 @@ static void PopupMetrics(HDC dc, Tip *t, int *w, int *h)
     if (sz.cx > maxw) maxw = sz.cx;
 
     *w = maxw + 16;
-    *h = (t->ncand + 2) * 20 + 8;
+    *h = (t->chime_ncand + 2) * 20 + 8;
 }
 
 static LRESULT CALLBACK PopupProc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -118,14 +271,14 @@ static LRESULT CALLBACK PopupProc(HWND h, UINT m, WPARAM w, LPARAM l)
         SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)((CREATESTRUCTW *)l)->lpCreateParams);
         break;
     case WM_MOUSEACTIVATE:
-        return MA_NOACTIVATE;                    /* never steal focus */
+        return MA_NOACTIVATE;
     case WM_ERASEBKGND:
         return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
         RECT rc, r;
-        WCHAR line[96];
+        WCHAR line[256];
         int i, y = 4;
         HGDIOBJ oldf = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
 
@@ -133,16 +286,15 @@ static LRESULT CALLBACK PopupProc(HWND h, UINT m, WPARAM w, LPARAM l)
         FillRect(dc, &rc, (HBRUSH)(COLOR_WINDOW + 1));
         SetBkMode(dc, TRANSPARENT);
         if (t) {
-            /* header: what has been typed */
             r.left = 8; r.right = rc.right - 8; r.top = y; r.bottom = y + 20;
             SetTextColor(dc, RGB(90, 90, 90));
             wsprintfW(line, L"> %s", t->buf);
             DrawTextW(dc, line, -1, &r, DT_SINGLELINE | DT_VCENTER);
             y += 20;
 
-            /* candidates */
             SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
-            for (i = 0; i < t->ncand; i++, y += 20) {
+            for (i = 0; i < t->chime_ncand; i++, y += 20) {
+                WCHAR wcand[MAX_BUF];
                 r.left = 2; r.right = rc.right - 2; r.top = y; r.bottom = y + 20;
                 if (i == t->sel) {
                     HBRUSH b = CreateSolidBrush(RGB(190, 215, 255));
@@ -150,11 +302,11 @@ static LRESULT CALLBACK PopupProc(HWND h, UINT m, WPARAM w, LPARAM l)
                     DeleteObject(b);
                 }
                 r.left = 8;
-                wsprintfW(line, L"%d. %s", i + 1, t->cand[i]);
+                Utf8ToWide(t->chime_cand[i], wcand, MAX_BUF);
+                wsprintfW(line, L"%d. %s", i + 1, wcand);
                 DrawTextW(dc, line, -1, &r, DT_SINGLELINE | DT_VCENTER);
             }
 
-            /* footer: text we READ from the document */
             r.left = 8; r.right = rc.right - 8; r.top = y; r.bottom = y + 20;
             SetTextColor(dc, RGB(130, 130, 130));
             wsprintfW(line, L"before: [%s]", t->before);
@@ -176,7 +328,7 @@ static void PopupCreate(Tip *t)
     wc.hInstance     = g_hinst;
     wc.hCursor       = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
     wc.lpszClassName = L"SampleCTipPopup";
-    RegisterClassExW(&wc);           /* fails harmlessly if already registered */
+    RegisterClassExW(&wc);
 
     t->popup = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
                                wc.lpszClassName, L"", WS_POPUP | WS_BORDER,
@@ -208,10 +360,7 @@ static void PopupShow(Tip *t)
     InvalidateRect(t->popup, NULL, TRUE);
 }
 
-/* ---------------------------------------------------------- edit session
- * ALL reading/writing of document text must happen inside DoEditSession.
- * We only use synchronous sessions, so the session object lives on the stack.
- */
+/* ---------------------------------------------------------- edit session */
 enum { ACT_UPDATE = 1, ACT_COMMIT = 2 };
 
 typedef struct Session {
@@ -220,7 +369,7 @@ typedef struct Session {
     Tip           *tip;
     ITfContext    *ctx;
     int            action;
-    const WCHAR   *text;             /* for ACT_COMMIT */
+    const WCHAR   *text;
 } Session;
 
 static HRESULT STDMETHODCALLTYPE Es_QI(ITfEditSession *This, REFIID riid, void **ppv)
@@ -233,9 +382,8 @@ static HRESULT STDMETHODCALLTYPE Es_QI(ITfEditSession *This, REFIID riid, void *
     return E_NOINTERFACE;
 }
 static ULONG STDMETHODCALLTYPE Es_AddRef(ITfEditSession *This)  { return 2; }
-static ULONG STDMETHODCALLTYPE Es_Release(ITfEditSession *This) { return 1; }  /* stack object */
+static ULONG STDMETHODCALLTYPE Es_Release(ITfEditSession *This) { return 1; }
 
-/* Read up to BEFORE_CHARS characters preceding the caret */
 static void ReadBeforeCaret(Tip *t, TfEditCookie ec, ITfRange *caret)
 {
     ITfRange *r = NULL;
@@ -251,7 +399,6 @@ static void ReadBeforeCaret(Tip *t, TfEditCookie ec, ITfRange *caret)
     ITfRange_Release(r);
 }
 
-/* Find where to put the popup (screen coordinates) */
 static void LocateCaret(Tip *t, TfEditCookie ec, ITfContext *ctx, ITfRange *caret)
 {
     ITfContextView *view = NULL;
@@ -268,7 +415,7 @@ static void LocateCaret(Tip *t, TfEditCookie ec, ITfContext *ctx, ITfRange *care
         }
         ITfContextView_Release(view);
     }
-    if (!ok) {                                   /* fallback for apps that return an empty rect */
+    if (!ok) {
         GUITHREADINFO gti;
         gti.cbSize = sizeof gti;
         if (GetGUIThreadInfo(0, &gti) && gti.hwndCaret) {
@@ -301,7 +448,6 @@ static HRESULT STDMETHODCALLTYPE Es_DoEditSession(ITfEditSession *This, TfEditCo
             ITfRange *r = NULL;
             if (SUCCEEDED(ITfInsertAtSelection_InsertTextAtSelection(
                               ins, ec, 0, s->text, (LONG)wcslen(s->text), &r)) && r) {
-                /* move the caret to just after the inserted text */
                 TF_SELECTION sel;
                 ITfRange_Collapse(r, ec, TF_ANCHOR_END);
                 sel.range = r;
@@ -338,6 +484,8 @@ static void Reset(Tip *t)
     t->buf[0] = 0;
     t->ncand = 0;
     t->sel = 0;
+    /* --- Chime integration --- */
+    FreeTipCandidates(t);
     PopupHide(t);
 }
 
@@ -355,7 +503,7 @@ static ULONG   STDMETHODCALLTYPE Ks_Release(ITfKeyEventSink *This);
 
 static HRESULT STDMETHODCALLTYPE Ks_OnSetFocus(ITfKeyEventSink *This, BOOL fForeground)
 {
-    if (!fForeground) Reset(TIP_FROM_SINK(This));     /* lost focus: drop the composition */
+    if (!fForeground) Reset(TIP_FROM_SINK(This));
     return S_OK;
 }
 
@@ -397,7 +545,7 @@ static HRESULT STDMETHODCALLTYPE Ks_OnKeyDown(ITfKeyEventSink *This, ITfContext 
             t->buf[t->len] = 0;
         }
         Suggest(t);
-        RunSession(t, pic, ACT_UPDATE, NULL);        /* read text + caret position */
+        RunSession(t, pic, ACT_UPDATE, NULL);
         PopupShow(t);
     }
     else switch (wParam) {
@@ -411,24 +559,28 @@ static HRESULT STDMETHODCALLTYPE Ks_OnKeyDown(ITfKeyEventSink *This, ITfContext 
         Reset(t);
         break;
     case VK_DOWN:
-        if (t->ncand) { t->sel = (t->sel + 1) % t->ncand; InvalidateRect(t->popup, NULL, TRUE); }
+        if (t->chime_ncand) { t->sel = (t->sel + 1) % t->chime_ncand; InvalidateRect(t->popup, NULL, TRUE); }
         break;
     case VK_UP:
-        if (t->ncand) { t->sel = (t->sel + t->ncand - 1) % t->ncand; InvalidateRect(t->popup, NULL, TRUE); }
+        if (t->chime_ncand) { t->sel = (t->sel + t->chime_ncand - 1) % t->chime_ncand; InvalidateRect(t->popup, NULL, TRUE); }
         break;
     case VK_SPACE:
     case VK_RETURN: {
         WCHAR out[MAX_BUF + 2];
-        lstrcpynW(out, t->ncand ? t->cand[t->sel] : t->buf, MAX_BUF);
+        if (t->chime_ncand > 0) {
+            Utf8ToWide(t->chime_cand[t->sel], out, MAX_BUF);
+        } else {
+            lstrcpynW(out, t->buf, MAX_BUF);
+        }
         if (wParam == VK_SPACE) lstrcatW(out, L" ");
         Commit(t, pic, out);
         break; }
     default:
         if (wParam >= '1' && wParam <= '9') {
             int i = (int)(wParam - '1');
-            if (i < t->ncand) {
+            if (i < t->chime_ncand) {
                 WCHAR out[MAX_BUF + 2];
-                lstrcpynW(out, t->cand[i], MAX_BUF);
+                Utf8ToWide(t->chime_cand[i], out, MAX_BUF);
                 lstrcatW(out, L" ");
                 Commit(t, pic, out);
             }
@@ -479,6 +631,8 @@ static ULONG STDMETHODCALLTYPE Tip_Release(ITfTextInputProcessor *This)
     Tip *t = TIP_FROM_TIP(This);
     LONG r = InterlockedDecrement(&t->ref);
     if (r == 0) {
+        /* --- Chime integration --- */
+        FreeTipCandidates(t);
         HeapFree(GetProcessHeap(), 0, t);
         InterlockedDecrement(&g_dllRefs);
     }
@@ -517,6 +671,8 @@ static HRESULT STDMETHODCALLTYPE Tip_Activate(ITfTextInputProcessor *This, ITfTh
         return hr;
     }
     PopupCreate(t);
+    /* --- Chime integration --- */
+    ChimeLoad();
     return S_OK;
 }
 
@@ -574,7 +730,7 @@ static HRESULT STDMETHODCALLTYPE Cf_CreateInstance(IClassFactory *This, IUnknown
     InterlockedIncrement(&g_dllRefs);
 
     hr = Tip_QI(&t->tip, riid, ppv);
-    Tip_Release(&t->tip);                         /* drop our creation ref */
+    Tip_Release(&t->tip);
     return hr;
 }
 
@@ -593,6 +749,16 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved)
     if (reason == DLL_PROCESS_ATTACH) {
         g_hinst = h;
         DisableThreadLibraryCalls(h);
+    }
+    /* --- Chime integration --- */
+    else if (reason == DLL_PROCESS_DETACH) {
+        if (reserved == NULL) {
+            ChimeUnload();
+            if (g_chime_cs_init) {
+                DeleteCriticalSection(&g_chime_cs);
+                g_chime_cs_init = 0;
+            }
+        }
     }
     return TRUE;
 }
@@ -624,15 +790,13 @@ STDAPI DllRegisterServer(void)
     GuidKey(&CLSID_SampleTip, clsid);
     GetModuleFileNameW(g_hinst, path, MAX_PATH);
 
-    /* 1. COM registration */
     wsprintfW(key, L"CLSID\\%s", clsid);
     st = RegSetKeyValueW(HKEY_CLASSES_ROOT, key, NULL, REG_SZ, TIP_DESC, sizeof(TIP_DESC));
-    if (st != ERROR_SUCCESS) return HRESULT_FROM_WIN32(st);       /* usually: not elevated */
+    if (st != ERROR_SUCCESS) return HRESULT_FROM_WIN32(st);
     wsprintfW(key, L"CLSID\\%s\\InprocServer32", clsid);
     RegSetKeyValueW(HKEY_CLASSES_ROOT, key, NULL, REG_SZ, path, (DWORD)((lstrlenW(path) + 1) * 2));
     RegSetKeyValueW(HKEY_CLASSES_ROOT, key, L"ThreadingModel", REG_SZ, apt, sizeof(apt));
 
-    /* 2. TSF profile (this is what puts it in the keyboard list) */
     hrInit = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     hr = CoCreateInstance(&CLSID_TF_InputProcessorProfiles, NULL, CLSCTX_INPROC_SERVER,
                           &IID_ITfInputProcessorProfileMgr, (void **)&mgr);
@@ -640,12 +804,11 @@ STDAPI DllRegisterServer(void)
         hr = ITfInputProcessorProfileMgr_RegisterProfile(
                  mgr, &CLSID_SampleTip, TIP_LANGID, &GUID_SampleProfile,
                  TIP_DESC, (ULONG)lstrlenW(TIP_DESC),
-                 NULL, 0, 0,          /* no icon */
-                 NULL, 0, TRUE, 0);   /* enabled by default */
+                 NULL, 0, 0,
+                 NULL, 0, TRUE, 0);
         ITfInputProcessorProfileMgr_Release(mgr);
     }
 
-    /* 3. Category: mark as a keyboard TIP */
     if (SUCCEEDED(hr) &&
         SUCCEEDED(CoCreateInstance(&CLSID_TF_CategoryMgr, NULL, CLSCTX_INPROC_SERVER,
                                    &IID_ITfCategoryMgr, (void **)&cat))) {
