@@ -1,0 +1,7 @@
+LIBRARY hello_tip.dll
+
+EXPORTS
+_DllCanUnloadNow@0
+_DllGetClassObject@12
+_DllRegisterServer@0
+_DllUnregisterServer@0

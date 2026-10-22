@@ -10,9 +10,6 @@
  * select it, and press F9.
  *
  * GUIDs / vtable slot order written from memory of msctf.h - verify against the SDK.
- i386-win32-tcc -shared .\tsf_hello.c .\tsf_hello.def -o tsf_hello.dll -lole32 -luser32 -ladvapi32
- C:\Windows\SysWOW64\regsvr32.exe .\tsf_hello.dll
- 
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -254,6 +251,12 @@ static const struct CFVtbl g_cfVtbl = { Cf_QI, Cf_AddRef, Cf_Release, Cf_Create,
 static CF g_factory = { &g_cfVtbl };
 
 /* --------------------------------------------------------- exports */
+/* TCC would export these as _Name@N; asm labels force the plain names regsvr32 expects. */
+__declspec(dllexport) HRESULT __stdcall DllGetClassObject(REFCLSID, REFIID, void**) __asm__("DllGetClassObject");
+__declspec(dllexport) HRESULT __stdcall DllCanUnloadNow(void)       __asm__("DllCanUnloadNow");
+__declspec(dllexport) HRESULT __stdcall DllRegisterServer(void)     __asm__("DllRegisterServer");
+__declspec(dllexport) HRESULT __stdcall DllUnregisterServer(void)   __asm__("DllUnregisterServer");
+
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r)
 { if (reason == DLL_PROCESS_ATTACH) { g_hinst = h; DisableThreadLibraryCalls(h); } return TRUE; }
 

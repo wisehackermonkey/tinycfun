@@ -1,10 +1,10 @@
-CC = gcc
-  CFLAGS = -Wall -Wextra -I./include
-  SRC_DIR = ./src
-  BIN_DIR = ./bin
-  
-  all:
-      $(CC) $(CFLAGS) -o $(BIN_DIR)/program $(SRC_DIR)/main.c
+CC      = gcc
+CFLAGS  = -O2 -Wall -Wextra -Wno-unused-parameter
+LIBS    = -lole32 -luuid -luser32 -lgdi32 -ladvapi32
 
-  clean:
-      rm -f $(BIN_DIR)/program
+tipdemo.dll: tipdemo.c tipdemo.def
+	$(CC) -shared $(CFLAGS) -o $@ tipdemo.c tipdemo.def $(LIBS) -static -s
+
+clean:
+	-del tipdemo.dll 2>nul
+	-rm -f tipdemo.dll

@@ -24,6 +24,7 @@
 // // tcc -impdef msctf.def  -run ./src/main.c
 // //tcc -impdef msctf.dll -o msctf.def
 // //tcc ./main.c -lmsctf -lole32 -o funcc.exe
+//gcc -shared -O2 -o hello_tip.dll ./hello_tip.c hello_tip.def -lole32 -loleaut32 -luser32 -lgdi32 -ladvapi32
 
 
 //   // keyboard processors, look at text service framework,
@@ -39,7 +40,7 @@
 //   //i386-win32-tcc  -shared .\tsf_hello.c .\tsf_hello.def -o tsf_hello.dll -lole32 -luser32 -ladvapi32 regsvr32 tsf_hello.dll 
 //tcc  -shared .\tsf_hello.c .\tsf_hello.def -o tsf_hello.dll -lole32 -luser32 -ladvapi32 regsvr32 tsf_hello.dll 
 //i386-win32-tcc -shared .\tsf_hello.c .\tsf_hello.def -o tsf_hello.dll -lole32 -luser32 -ladvapi32
-
+// regsvr32 hello_tip.dll
 //+---------------------------------------------------------------------------
 //
 //  HELLO_WIN.C - Windows GUI 'Hello World!' Example
