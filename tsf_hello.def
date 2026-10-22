@@ -1,7 +1,0 @@
-LIBRARY tsf_hello.dll
-
-EXPORTS
-DllCanUnloadNow
-DllGetClassObject
-_DllRegisterServer@0
-_DllUnregisterServer@0
